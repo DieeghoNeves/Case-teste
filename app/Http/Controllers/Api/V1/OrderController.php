@@ -4,42 +4,40 @@ namespace App\Http\Controllers\Api\V1;
 
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Foundation\Validation\ValidatesRequests;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Routing\Controller as BaseController;
+use Illuminate\Auth\Access\AuthorizationException;
+use Symfony\Component\HttpFoundation\Response;
 use App\Http\Requests\OrderStoreRequest;
 use App\Http\Resources\OrderResource;
-use App\Jobs\SendOrderConfirmation;
-use Illuminate\Support\Facades\DB;
+use App\Services\OrderService;
 use Illuminate\Http\Request;
-use App\Models\Order;
 
 class OrderController extends BaseController
 {
     use AuthorizesRequests, ValidatesRequests;
 
-    public function __construct()
-    {
-        
-        $this->middleware('auth:sanctum');
-        $this->middleware('throttle:60,1'); 
-    }
+    protected OrderService $orderService;
 
+    public function __construct(OrderService $orderService)
+    {
+        $this->middleware('auth:sanctum');
+        $this->middleware('throttle:60,1');
+        $this->orderService = $orderService;
+    }
 
     public function index(Request $request)
     {
-        $query = $request->user()->orders()->with('items');
-
-        if ($request->filled('status')) {
-            $query->where('status', $request->get('status'));
-        }
-
         $perPage = (int) $request->get('per_page', 15);
-        $orders = $query->orderByDesc('created_at')->paginate($perPage);
+        $filters = ['status' => $request->get('status')];
+
+        $orders = $this->orderService->index($request->user(), $filters, $perPage);
 
         if ($orders->isEmpty()) {
             return response()->json([
                 'message' => 'Nenhum pedido cadastrado!',
                 'data' => [],
-            ], 200);
+            ], Response::HTTP_OK);
         }
 
         return OrderResource::collection($orders)->additional([
@@ -51,118 +49,47 @@ class OrderController extends BaseController
 
     public function show(Request $request, $id)
     {
-        $order = Order::with('items')->find($id);
-
-        if (! $order) {
-            return response()->json([
-                'message' => 'Pedido não encontrado!'
-            ], 404);
+        try {
+            $order = $this->orderService->show($request->user(), (int) $id);
+            return new OrderResource($order);
+        } catch (ModelNotFoundException $e) {
+            return response()->json(['message' => 'Pedido não encontrado!'], Response::HTTP_NOT_FOUND);
+        } catch (AuthorizationException $e) {
+            return response()->json(['message' => 'Acesso negado ao pedido.'], Response::HTTP_FORBIDDEN);
         }
-
-        $user = $request->user();
-        if ($order->user_id !== $user->id) {
-            return response()->json([
-                'message' => 'Acesso negado ao pedido.'
-            ], 403);
-        }
-
-        return new OrderResource($order);
     }
-
 
     public function store(OrderStoreRequest $request)
     {
         $user = $request->user();
+        $data = $request->only(['items', 'meta']);
+        $order = $this->orderService->store($user, $data);
 
-        if (!$user) {
-            return response()->json(['message' => 'Usuário não autenticado.'], 401);
-        }
-
-        $incomingItems = $request->get('items', []);
-        $grouped = [];
-        $merged = false;
-
-        foreach ($incomingItems as $item) {
-            $nameKey = mb_strtolower(trim($item['product_name']));
-
-            $unitPrice = isset($item['unit_price']) ? (float) $item['unit_price'] : 0.0;
-            $quantity  = isset($item['quantity']) ? (int) $item['quantity'] : 0;
-
-            if (isset($grouped[$nameKey])) {
-                $grouped[$nameKey]['quantity'] += $quantity;
-
-                $merged = true;
-            } else {
-                $grouped[$nameKey] = [
-                    'product_name' => $item['product_name'],
-                    'unit_price' => $unitPrice,
-                    'quantity' => $quantity,
-                ];
-            }
-        }
-
-        $finalItems = array_values($grouped);
-
-        $order = DB::transaction(function () use ($request, $user, $finalItems) {
-            $order = Order::create([
-                'user_id' => $user->id,
-                'status' => 'pending',
-                'meta' => $request->get('meta', []),
-            ]);
-
-            foreach ($finalItems as $item) {
-                $order->items()->create([
-                    'product_name' => $item['product_name'],
-                    'unit_price' => $item['unit_price'],
-                    'quantity' => $item['quantity'],
-                ]);
-            }
-
-            $order->recalculateTotal();
-
-            return $order;
-        });
-
-        if ($order instanceof Order) {
-            SendOrderConfirmation::dispatch($order->id)->onQueue('emails');
-        }
-
-        $resource = (new OrderResource($order->load('items')))->response()->setStatusCode(201);
+        $resource = (new OrderResource($order))->response()->setStatusCode(Response::HTTP_CREATED);
         $responseData = $resource->getData(true);
 
-        if ($merged) {
-            $responseData['message'] = 'Produto ja cadastrado, adicionado na quantidade!';
+        if ($order->getAttribute('was_merged')) {
+            $responseData['message'] = 'Produto já cadastrado, adicionado na quantidade!';
         }
 
-        return response()->json($responseData, 201);
+        return response()->json($responseData, Response::HTTP_CREATED);
     }
 
     public function cancel(Request $request, $id)
     {
-        $order = Order::find($id);
+        try {
+            $order = $this->orderService->cancel((int) $id);
 
-        if (!$order) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Pedido não encontrado!',
-            ], 404);
-        }
-
-        if ($order->status === 'cancelled') {
             return response()->json([
                 'success' => true,
                 'status' => $order->status,
-                'message' => 'Pedido já estava cancelado.'
-            ], 200);
+                'message' => 'Pedido cancelado com sucesso.'
+            ], Response::HTTP_OK);
+        } catch (ModelNotFoundException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Pedido não encontrado!',
+            ], Response::HTTP_NOT_FOUND);
         }
-
-        $order->update(['status' => 'cancelled']);
-
-        return response()->json([
-            'success' => true,
-            'status' => 'cancelled',
-            'message' => 'Pedido cancelado com sucesso.'
-        ], 200);
     }
-
 }
